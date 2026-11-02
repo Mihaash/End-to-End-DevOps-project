@@ -1,0 +1,91 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_DEFAULT_REGION = "${params.AWS_REGION}" // set via build parameters
+        ACCOUNT_ID = "${params.AWS_ACCOUNT_ID}"
+        IMAGE_TAG = "latest"
+    }
+
+    parameters {
+        string(name: 'AWS_ACCOUNT_ID', defaultValue: '', description: 'AWS account ID')
+        string(name: 'AWS_REGION', defaultValue: 'us-east-1', description: 'AWS region')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Lint') {
+            parallel {
+                stage('Backend Lint') {
+                    steps {
+                        dir('backend') {
+                            sh 'python -m venv venv && . venv/bin/activate && pip install -r requirements.txt && flake8 .' // flake8 required in requirements
+                        }
+                    }
+                }
+                stage('Frontend Lint') {
+                    steps {
+                        dir('frontend') {
+                            sh 'npm ci && npm run lint'
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Build & Push Docker Images') {
+            parallel {
+                stage('Build Backend') {
+                    steps {
+                        dir('backend') {
+                            script {
+                                def image = "${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/ekart-backend:${IMAGE_TAG}"
+                                sh "docker build -t ${image} ."
+                                sh "aws ecr get-login-password | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+                                sh "docker push ${image}"
+                            }
+                        }
+                    }
+                }
+                stage('Build Frontend') {
+                    steps {
+                        dir('frontend') {
+                            script {
+                                def image = "${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/ekart-frontend:${IMAGE_TAG}"
+                                sh "docker build -t ${image} ."
+                                sh "aws ecr get-login-password | docker login --username AWS --password-stdin ${ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+                                sh "docker push ${image}"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Terraform') {
+            steps {
+                dir('infrastructure/terraform') {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials']]) {
+                        sh 'terraform init'
+                        sh "terraform plan -var 'account_id=${ACCOUNT_ID}' -var 'aws_region=${AWS_DEFAULT_REGION}'"
+                        sh "terraform apply -auto-approve -var 'account_id=${ACCOUNT_ID}' -var 'aws_region=${AWS_DEFAULT_REGION}'"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs()
+        }
+        failure {
+            mail to: 'devops@example.com', subject: "Failed Build: ${env.JOB_NAME} #${env.BUILD_NUMBER}", body: "Check Jenkins console for details."
+        }
+    }
+}
